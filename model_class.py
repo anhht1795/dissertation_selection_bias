@@ -4,7 +4,7 @@ import numpy as np
 from typing import List, Optional, Union, Dict, Tuple
 from scipy.special import logit, expit
 from catboost import CatBoostClassifier, Pool
-from sklearn.metrics import roc_auc_score, precision_recall_curve
+from sklearn.metrics import roc_auc_score, precision_recall_curve, auc
 from sklearn.model_selection import RepeatedStratifiedKFold
 from sklearn.preprocessing import LabelEncoder
 
@@ -37,8 +37,9 @@ class CatBoostXT_BAG:
                 y = y.values
         
         # Encode target if it's categorical
-        if y.dtype == 'object' or y.dtype.name == 'category':
-            y = self.le.fit_transform(y)
+        if y is not None:
+            if y.dtype == 'object' or y.dtype.name == 'category':
+                y = self.le.fit_transform(y)
         
 
         # Identify categorical features if not provided
@@ -86,8 +87,8 @@ class CatBoostXT_BAG:
             # Update  params for multiclass if needed
             if len(np.unique(y)) > 2:
                 self.params.update({'loss_function': 'MultiClass', 'eval_metric': 'MultiClass'})
-            else:
-                self.params.update({'loss_function': 'Logloss', 'eval_metric': 'AUC'})
+            # else:
+            #     # self.params.update({'loss_function': 'Logloss', 'eval_metric': 'AUC'})
             
             # Initialize and train CatBoost model
             model = CatBoostClassifier(
@@ -195,16 +196,17 @@ class CatBoostXT_BAG:
 
     def evaluate( # evaluate model performance using ROC AUC and PR AUC
         self,
-        y_true: Union[pd.Series, np.ndarray],
-        y_pred_proba: np.ndarray,
+        X: pd.DataFrame,
+        y: Union[pd.Series, np.ndarray],
     ) -> Dict[str, float]:
-        if y_true.dtype == 'object' or y_true.dtype.name == 'category':
-            y_true = self.le.transform(y_true)
         
+        y_pred_proba = self.predict_proba(X=X)
         
-        roc_auc = roc_auc_score(y_true, y_pred_proba[:, 1])
-        pr_auc = precision_recall_curve(y_true, y_pred_proba[:, 1])
-        
+        roc_auc = roc_auc_score(y, y_pred_proba[:, 1])
+        precision, recall, thresholds = precision_recall_curve(y, y_pred_proba[:, 1])
+        #calculate PR AUC using sklearn auc function
+        pr_auc = auc(recall, precision)
+
         return {
             'ROC_AUC': roc_auc,
             'PR_AUC': pr_auc,
