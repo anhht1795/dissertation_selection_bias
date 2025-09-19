@@ -27,6 +27,7 @@ class CatBoostXT_BAG:
         self.le = LabelEncoder()
         self.feature_importances_ = None
         self.params = {}
+        self.used_features = []
     
     def prepare_data(
         self,
@@ -110,6 +111,7 @@ class CatBoostXT_BAG:
             
             self.models.append(model)
 
+        self.used_features = X.columns.tolist()
             
         return self
         
