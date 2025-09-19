@@ -547,12 +547,12 @@ def bb_features_per_account(bb: pd.DataFrame, *, months_windows: list[int] = [6,
 
     For each window w in months_windows, produce prefixed metrics:
       - w{w}_months_count: number of reported months
-      - w{w}_dpd_mean / dpd_max / dpd_sum (using STATUS_CODE; C=-1 ignored in mean/sum)
-      - w{w}_share_dpd_gt0: share of months with dpd>0
+      - w{w}_status_mean / status_max / status_sum (using STATUS_CODE; C=-1 ignored in mean/sum)
+      - w{w}_share_status_gt0: share of months with status>0
       - w{w}_share_unknown: share of months with STATUS=='X'
       - w{w}_share_closed: share of months with STATUS=='C'
-      - w{w}_months_since_last_dpd_gt0: distance (in months) from last month with dpd>0 to -1 (NaN if never)
-      - w{w}_longest_streak_dpd_gt0: longest consecutive delinquent streak within window
+      - w{w}_months_since_last_status_gt0: distance (in months) from last month with status>0 to -1 (NaN if never)
+      - w{w}_longest_streak_status_gt0: longest consecutive delinquent streak within window
       - w{w}_status_0..5: fraction of months in each bucket
     Also compute non-windowed recency signals:
       - last_month (min MONTHS_BALANCE, typically -1 if exists)
@@ -580,19 +580,19 @@ def bb_features_per_account(bb: pd.DataFrame, *, months_windows: list[int] = [6,
         # Exclude C(-1) and NaN from mean/sum; use only >=0 codes
         valid = bw[bw["STATUS_CODE"].fillna(-99) >= 0]
         grp_valid = valid.groupby("SK_BUREAU_ID")
-        dpd_mean = grp_valid["STATUS_CODE"].mean().rename(f"w{w}_dpd_mean")
-        dpd_max = grp_valid["STATUS_CODE"].max().rename(f"w{w}_dpd_max")
-        dpd_sum = grp_valid["STATUS_CODE"].sum().rename(f"w{w}_dpd_sum")
+        status_mean = grp_valid["STATUS_CODE"].mean().rename(f"w{w}_status_mean")
+        status_max = grp_valid["STATUS_CODE"].max().rename(f"w{w}_status_max")
+        status_sum = grp_valid["STATUS_CODE"].sum().rename(f"w{w}_status_sum")
 
-        share_dpd_gt0 = grp.apply(lambda g: (g["STATUS_CODE"].fillna(-1) > 0).mean()).rename(f"w{w}_share_dpd_gt0")
-        share_dpd_gt1 = grp.apply(lambda g: (g["STATUS_CODE"].fillna(-1) > 1).mean()).rename(f"w{w}_share_dpd_gt1")
-        share_dpd_gt2 = grp.apply(lambda g: (g["STATUS_CODE"].fillna(-1) > 2).mean()).rename(f"w{w}_share_dpd_gt2")
-        share_dpd_gt3 = grp.apply(lambda g: (g["STATUS_CODE"].fillna(-1) > 3).mean()).rename(f"w{w}_share_dpd_gt3")
-        share_dpd_gt4 = grp.apply(lambda g: (g["STATUS_CODE"].fillna(-1) > 4).mean()).rename(f"w{w}_share_dpd_gt4")
+        share_status_gt0 = grp.apply(lambda g: (g["STATUS_CODE"].fillna(-1) > 0).mean()).rename(f"w{w}_share_status_gt0")
+        share_status_gt1 = grp.apply(lambda g: (g["STATUS_CODE"].fillna(-1) > 1).mean()).rename(f"w{w}_share_status_gt1")
+        share_status_gt2 = grp.apply(lambda g: (g["STATUS_CODE"].fillna(-1) > 2).mean()).rename(f"w{w}_share_status_gt2")
+        share_status_gt3 = grp.apply(lambda g: (g["STATUS_CODE"].fillna(-1) > 3).mean()).rename(f"w{w}_share_status_gt3")
+        share_status_gt4 = grp.apply(lambda g: (g["STATUS_CODE"].fillna(-1) > 4).mean()).rename(f"w{w}_share_status_gt4")
         share_unknown = grp.apply(lambda g: (g["STATUS"] == "X").mean()).rename(f"w{w}_share_unknown")
         share_closed = grp.apply(lambda g: (g["STATUS"] == "C").mean()).rename(f"w{w}_share_closed")
 
-        # months since last dpd>0 to -1
+        # months since last status>0 to -1
         def _msld(g: pd.DataFrame) -> float:
             g = g.sort_values("MONTHS_BALANCE")  # ascending toward -1
             delin = g.loc[g["STATUS_CODE"] > 0, "MONTHS_BALANCE"]
@@ -600,14 +600,14 @@ def bb_features_per_account(bb: pd.DataFrame, *, months_windows: list[int] = [6,
                 return np.nan
             last_delin = delin.max()
             return float(-1 - last_delin)  # distance from last delinquency month to -1
-        months_since_last_dpd = grp.apply(_msld).rename(f"w{w}_months_since_last_dpd_gt0")
+        months_since_last_status = grp.apply(_msld).rename(f"w{w}_months_since_last_status_gt0")
 
         # longest consecutive delinquent streak
         def _streak(g: pd.DataFrame) -> int:
             g = g.sort_values("MONTHS_BALANCE")
             flags = (g["STATUS_CODE"].fillna(-1) > 0).astype(int)
             return _run_length_encode(flags)
-        longest_streak = grp.apply(_streak).rename(f"w{w}_longest_streak_dpd_gt0")
+        longest_streak = grp.apply(_streak).rename(f"w{w}_longest_streak_status_gt0")
 
         # status mix (fractions for 0..5)
         mixes = []
@@ -616,9 +616,9 @@ def bb_features_per_account(bb: pd.DataFrame, *, months_windows: list[int] = [6,
             mixes.append(grp.apply(lambda g, c=code: (g["STATUS_CODE"] == c).mean()).rename(col))
 
         block = pd.concat([
-            months_count, dpd_mean, dpd_max, dpd_sum,
-            share_dpd_gt0, share_dpd_gt1, share_dpd_gt2, share_dpd_gt3, share_dpd_gt4, share_unknown, share_closed,
-            months_since_last_dpd, longest_streak, *mixes
+            months_count, status_mean, status_max, status_sum,
+            share_status_gt0, share_status_gt1, share_status_gt2, share_status_gt3, share_status_gt4, share_unknown, share_closed,
+            months_since_last_status, longest_streak, *mixes
         ], axis=1).reset_index()
         outs.append(block)
 
@@ -791,9 +791,9 @@ def prep_application(app: pd.DataFrame) -> pd.DataFrame:
         d["HOUR_COS"] = np.cos(2 * np.pi * h / 24.0)
         d["HOUR_LATE_FLAG"] = (h >= 20) | (h <= 6)
         d["HOUR_LATE_FLAG"] = d["HOUR_LATE_FLAG"].astype(float)
-    if "WEEKDAY_APPR_PROCESS_START" in d:
-        # keep raw; optionally frequency-encode as numeric helper
-        d["WEEKDAY_FREQ"] = _freq_encode(d["WEEKDAY_APPR_PROCESS_START"].astype(str))
+    # if "WEEKDAY_APPR_PROCESS_START" in d:
+    #     # keep raw; optionally frequency-encode as numeric helper
+    #     d["WEEKDAY_FREQ"] = _freq_encode(d["WEEKDAY_APPR_PROCESS_START"].astype(str))
 
     # environment aggregates (normalized building variables)
     env_cols = [c for c in d.columns if c.endswith(('_AVG','_MODE','_MEDI'))]
@@ -802,15 +802,15 @@ def prep_application(app: pd.DataFrame) -> pd.DataFrame:
         d["ENV_MISSING_CNT"] = d[env_cols].isna().sum(axis=1)
         d["ENV_COVERAGE"] = 1.0 - d["ENV_MISSING_CNT"].astype(float)/float(len(env_cols))
 
-    # categorical cleaning for downstream encoding (kept as text)
-    for cat in [
-        "NAME_CONTRACT_TYPE","CODE_GENDER","NAME_TYPE_SUITE","NAME_INCOME_TYPE",
-        "NAME_EDUCATION_TYPE","NAME_FAMILY_STATUS","NAME_HOUSING_TYPE",
-        "OCCUPATION_TYPE","ORGANIZATION_TYPE",
-    ]:
-        if cat in d.columns:
-            d[cat] = d[cat].astype(str).str.strip().str.lower()
-            d[f"{cat}_FREQ"] = _freq_encode(d[cat])
+    # # categorical cleaning for downstream encoding (kept as text)
+    # for cat in [
+    #     "NAME_CONTRACT_TYPE","CODE_GENDER","NAME_TYPE_SUITE","NAME_INCOME_TYPE",
+    #     "NAME_EDUCATION_TYPE","NAME_FAMILY_STATUS","NAME_HOUSING_TYPE",
+    #     "OCCUPATION_TYPE","ORGANIZATION_TYPE",
+    # ]:
+    #     if cat in d.columns:
+    #         d[cat] = d[cat].astype(str).str.strip().str.lower()
+    #         d[f"{cat}_FREQ"] = _freq_encode(d[cat])
 
     return d
 
