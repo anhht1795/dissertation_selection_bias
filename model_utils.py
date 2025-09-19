@@ -16,6 +16,12 @@ def f_roc_auc(y_actual, y_pred):
     auc = roc_auc_score(y_actual, y_pred)
     return auc
 
+def f_pr_auc(y_actual, y_pred):
+    """Calculate the PR AUC."""
+    precision, recall, thresholds = precision_recall_curve(y_actual, y_pred)
+    pr_auc = np.trapz(precision, recall)
+    return pr_auc
+
 def f_plot_auc(y_actual, y_pred):
     """Plot the ROC curve."""
     fpr, tpr, thresholds = roc_curve(y_actual, y_pred)
@@ -49,3 +55,23 @@ def f_ks(y_actual, y_pred):
     fpr, tpr, thresholds = roc_curve(y_actual, y_pred)
     ks = max(tpr - fpr)
     return ks
+
+def f_precision(y_actual, y_pred, threshold=0.5):
+    """Calculate precision."""
+    y_pred_label = (y_pred >= threshold).astype(int)
+    return precision_score(y_actual, y_pred_label)
+
+def f_recall(y_actual, y_pred, threshold=0.5):
+    """Calculate recall."""
+    y_pred_label = (y_pred >= threshold).astype(int)
+    return recall_score(y_actual, y_pred_label)
+
+def f_accuracy(y_actual, y_pred, threshold=0.5):
+    """Calculate accuracy."""
+    y_pred_label = (y_pred >= threshold).astype(int)
+    return accuracy_score(y_actual, y_pred_label)
+
+def f_fbeta_score(y_actual, y_pred, beta=1, threshold=0.5):
+    """Calculate F-beta score."""
+    y_pred_label = (y_pred >= threshold).astype(int)
+    return f1_score(y_actual, y_pred_label, beta=beta)
