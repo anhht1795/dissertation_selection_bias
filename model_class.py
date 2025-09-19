@@ -26,6 +26,8 @@ class CatBoostXT_BAG:
         self.models = []
         self.le = LabelEncoder()
         self.feature_importances_ = None
+        self.feature_importances_shap_ = None
+        self.feature_interaction_ = None
         self.params = {}
         self.used_features = []
     
@@ -160,8 +162,9 @@ class CatBoostXT_BAG:
         
         # return feature importances as a dictionary sorted by importance
         importance_dict = dict(sorted(self.feature_importances_.items(), key=lambda item: item[1], reverse=True))
-        
-        return pd.DataFrame.from_dict(importance_dict,orient='index').reset_index().rename(columns={'index':'feature',0:'importance'})
+        df_imp = pd.DataFrame.from_dict(importance_dict,orient='index').reset_index().rename(columns={'index':'feature',0:'importance'})
+        self.feature_importances_ = df_imp
+        return df_imp
     
     
     # def a function to get shap feature importance
@@ -183,8 +186,9 @@ class CatBoostXT_BAG:
         
         # return SHAP feature importances as a dictionary sorted by importance
         importance_dict = dict(sorted(shap_feature_importances_.items(), key=lambda item: item[1], reverse=True))
-        
-        return pd.DataFrame.from_dict(importance_dict,orient='index').reset_index().rename(columns={'index':'feature',0:'importance'})
+        df_imp_shap = pd.DataFrame.from_dict(importance_dict,orient='index').reset_index().rename(columns={'index':'feature',0:'importance'})
+        self.feature_importances_shap_ = df_imp_shap
+        return df_imp_shap
     
     def get_average_feature_interaction_score(
             self,
@@ -197,10 +201,13 @@ class CatBoostXT_BAG:
         for model in self.models:
             interaction_scores = model.get_feature_importance(self.prepare_data(X, is_train=False), type='Interaction')
             all_interaction_scores.append(pd.DataFrame(interaction_scores, columns=['Feature_1','Feature_2','Score']))
-        
+        # map column indices to feature names
+        interaction_scores['Feature_1'] = interaction_scores['Feature_1'].map(lambda x: X.columns[x])
+        interaction_scores['Feature_2'] = interaction_scores['Feature_2'].map(lambda x: X.columns[x])
+
         df_interaction_scores = pd.concat(all_interaction_scores)
-        
-        return df_interaction_scores.groupby(['Feature_1','Feature_2'],as_index=False).agg({'Score':'mean'}).sort_values(by='Score',ascending=False)
+        self.feature_interaction_ = df_interaction_scores
+        return df_interaction_scores
 
     def plot_shap_summary_plot(
         self,
@@ -214,7 +221,7 @@ class CatBoostXT_BAG:
         
         for model in self.models:
             exlainer = shap.TreeExplainer(model)
-            shap_values = exlainer.shap_values(X)
+            shap_values = exlainer.shap_values(self.prepare_data(X, is_train=False))
 
             if isinstance(shap_values, list) and len(shap_values)==2:
                 shap_values = shap_values[1]
@@ -237,7 +244,7 @@ class CatBoostXT_BAG:
         
         for model in self.models:
             exlainer = shap.TreeExplainer(model)
-            shap_values = exlainer.shap_values(X)
+            shap_values = exlainer.shap_values(self.prepare_data(X, is_train=False))
 
             if isinstance(shap_values, list) and len(shap_values)==2:
                 shap_values = shap_values[1]
@@ -259,7 +266,7 @@ class CatBoostXT_BAG:
         
         for model in self.models:
             exlainer = shap.TreeExplainer(model)
-            shap_values = exlainer.shap_values(X)
+            shap_values = exlainer.shap_values(self.prepare_data(X, is_train=False))
 
             if isinstance(shap_values, list) and len(shap_values)==2:
                 shap_values = shap_values[1]
