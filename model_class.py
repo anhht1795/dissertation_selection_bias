@@ -158,10 +158,10 @@ class CatBoostXT_BAG:
         
         feature_importances /= len(self.models)
         
-        self.feature_importances_ = dict(zip(X.columns, feature_importances))
+        #self.feature_importances_ = dict(zip(X.columns, feature_importances))
         
         # return feature importances as a dictionary sorted by importance
-        importance_dict = dict(sorted(self.feature_importances_.items(), key=lambda item: item[1], reverse=True))
+        importance_dict = dict(sorted(dict(zip(X.columns, feature_importances)).items(), key=lambda item: item[1], reverse=True))
         df_imp = pd.DataFrame.from_dict(importance_dict,orient='index').reset_index().rename(columns={'index':'feature',0:'importance'})
         self.feature_importances_ = df_imp
         return df_imp
@@ -196,16 +196,15 @@ class CatBoostXT_BAG:
     ) -> pd.DataFrame:
         # Aggregate feature interaction scores from all models
         all_interaction_scores = []
-        interaction_scores = np.zeros(X.shape[1])
         
         for model in self.models:
             interaction_scores = model.get_feature_importance(self.prepare_data(X, is_train=False), type='Interaction')
             all_interaction_scores.append(pd.DataFrame(interaction_scores, columns=['Feature_1','Feature_2','Score']))
-        # map column indices to feature names
-        interaction_scores['Feature_1'] = interaction_scores['Feature_1'].map(lambda x: X.columns[x])
-        interaction_scores['Feature_2'] = interaction_scores['Feature_2'].map(lambda x: X.columns[x])
+        
 
         df_interaction_scores = pd.concat(all_interaction_scores)
+        df_interaction_scores['Feature_1'] = df_interaction_scores['Feature_1'].map(lambda x: X.columns[int(x)])
+        df_interaction_scores['Feature_2'] = df_interaction_scores['Feature_2'].map(lambda x: X.columns[int(x)])
         self.feature_interaction_ = df_interaction_scores
         return df_interaction_scores
 
