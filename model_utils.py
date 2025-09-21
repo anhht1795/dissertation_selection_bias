@@ -1,6 +1,6 @@
 import pandas as pd
 import numpy as np
-from sklearn.metrics import f1_score, accuracy_score, precision_score, recall_score, roc_curve, precision_recall_curve, roc_auc_score
+from sklearn.metrics import f1_score, accuracy_score, precision_score, recall_score, roc_curve, precision_recall_curve, roc_auc_score, confusion_matrix
 
 def f_gini(y_actual, y_pred):
     """Calculate the Gini coefficient."""
@@ -75,3 +75,65 @@ def f_fbeta_score(y_actual, y_pred, beta=1, threshold=0.5):
     """Calculate F-beta score."""
     y_pred_label = (y_pred >= threshold).astype(int)
     return f1_score(y_actual, y_pred_label, beta=beta)
+
+
+def cutoff_confusion_matrix(y_true, y_score, cutoff_fraction=0.5, profit_margin=1.0, loss_cost=5.0):
+    """
+    Evaluate model performance at a given cutoff fraction of applicants.
+    
+    Parameters
+    ----------
+    y_true : array-like
+        True binary labels (1 = bad/default, 0 = good).
+    y_score : array-like
+        Predicted scores or probabilities (higher = riskier).
+    cutoff_fraction : float, default=0.5
+        Fraction of applicants to reject (e.g., 0.5 = reject 50% highest-risk).
+    profit_margin : float, default=1.0
+        Profit per good loan (proxy).
+    loss_cost : float, default=5.0
+        Cost per bad loan (proxy).
+    
+    Returns
+    -------
+    results : dict
+        Confusion matrix components + key business metrics.
+    """
+
+    y_true = np.asarray(y_true)
+    y_score = np.asarray(y_score)
+
+    n = len(y_score)
+    cutoff_index = int((1 - cutoff_fraction) * n)  # accept bottom fraction
+    threshold = np.sort(y_score)[cutoff_index]
+
+    # Predictions: accept (0) if score below threshold, reject (1) if above
+    y_pred = (y_score >= threshold).astype(int)  # 1 = reject, 0 = accept
+
+    # Map to confusion matrix: TN, FP, FN, TP
+    # In credit terms:
+    # TN = bad correctly rejected
+    # FP = good wrongly rejected
+    # FN = bad wrongly accepted
+    # TP = good correctly accepted
+    tn, fp, fn, tp = confusion_matrix(y_true, y_pred).ravel()
+
+    # Business metrics
+    approval_rate = (tp + fn) / n
+    bad_rate_accepted = fn / (tp + fn) if (tp + fn) > 0 else 0
+    rejection_efficiency = tn / (tn + fp) if (tn + fp) > 0 else 0
+    expected_profit = tp * profit_margin - fn * loss_cost
+
+    results = {
+        "cutoff_threshold": threshold,
+        "TN (bad_rejected)": tn,
+        "FP (good_rejected)": fp,
+        "FN (bad_accepted)": fn,
+        "TP (good_accepted)": tp,
+        "approval_rate": approval_rate,
+        "bad_rate_in_accepted": bad_rate_accepted,
+        "rejection_efficiency": rejection_efficiency,
+        "expected_profit": expected_profit
+    }
+
+    return results
