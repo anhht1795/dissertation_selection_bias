@@ -44,7 +44,7 @@ class LightGBMXT_BAG:
         self,
         X: pd.DataFrame,
         y: Optional[Union[pd.Series, List, np.ndarray]] = None,
-        is_train: bool = True
+        is_train: bool = True,
     ) -> Tuple[np.ndarray, Optional[np.ndarray]]:
         # Handle y preprocessing
         if y is not None:
@@ -100,7 +100,9 @@ class LightGBMXT_BAG:
         self,
         X: pd.DataFrame,
         y: Union[pd.Series, np.ndarray],
+        weights: Optional[Union[pd.Series, List, np.ndarray]] = None,
         eval_set: Optional[Tuple] = None,
+        eval_set_weights: Optional[Union[pd.Series, List, np.ndarray]] = None
     ):
         if y is not None:
             if isinstance(y, pd.Series):
@@ -112,21 +114,22 @@ class LightGBMXT_BAG:
         # If num_bag_folds < 2, fit only 1 model without k-fold
         if self.num_bag_folds < 2:
             X_processed, y_processed = self.prepare_data(X, y, is_train=True)
-            
-            # Prepare eval set if provided
-            if eval_set is not None:
-                X_eval, y_eval = self.prepare_data(eval_set[0], eval_set[1], is_train=False)
-                eval_data = [(X_eval, y_eval)]
-            else:
-                eval_data = None
+        
 
             # Update params for multiclass if needed
             if len(np.unique(y)) > 2:
                 self.params.update({'objective': 'multiclass', 'metric': 'multi_logloss', 'num_class': len(np.unique(y))})
 
             # Create LightGBM dataset
-            train_data = lgb.Dataset(X_processed, label=y_processed, categorical_feature=self.cat_feature_indices)
-            evat_dataset = lgb.Dataset(X_eval, label=y_eval, categorical_feature=self.cat_feature_indices,reference=train_data)
+            train_data = lgb.Dataset(X_processed, label=y_processed, categorical_feature=self.cat_feature_indices, weights=weights)
+            # Prepare eval set if provided
+            if eval_set is not None:
+                X_eval, y_eval = self.prepare_data(eval_set[0], eval_set[1], is_train=False)
+                # eval_data = [(X_eval, y_eval)]
+                evat_dataset = lgb.Dataset(X_eval, label=y_eval, categorical_feature=self.cat_feature_indices,reference=train_data, weights=eval_set_weights)
+            else:
+                evat_dataset = None
+            
             model = lgb.train(
                 params=self.params,
                 train_set=train_data,
@@ -150,16 +153,17 @@ class LightGBMXT_BAG:
                 
                 X_train_processed, y_train_processed = self.prepare_data(X_train, y_train, is_train=(fold==0))
                 X_val_processed, y_val_processed = self.prepare_data(X_val, y_val, is_train=False)
-                
+                w_train = weights[train_idx] if weights is not None else None
+                w_val = weights[val_idx] if weights is not None else None
                 
                 # Create LightGBM datasets
-                train_data = lgb.Dataset(X_train_processed, label=y_train_processed, categorical_feature=self.cat_feature_indices)
-                val_data = lgb.Dataset(X_val_processed, label=y_val_processed, categorical_feature=self.cat_feature_indices, reference=train_data)
+                train_data = lgb.Dataset(X_train_processed, label=y_train_processed, categorical_feature=self.cat_feature_indices, weights=w_train)
+                val_data = lgb.Dataset(X_val_processed, label=y_val_processed, categorical_feature=self.cat_feature_indices, reference=train_data, weights=w_val)
                 
                 # Prepare eval set if provided
                 if eval_set is not None:
                     X_eval, y_eval = self.prepare_data(eval_set[0], eval_set[1], is_train=False)
-                    eval_data = lgb.Dataset(X_eval, label=y_eval, categorical_feature=self.cat_feature_indices, reference=train_data)
+                    eval_data = lgb.Dataset(X_eval, label=y_eval, categorical_feature=self.cat_feature_indices, reference=train_data, weights=eval_set_weights)
                 else:
                     eval_data = val_data
 

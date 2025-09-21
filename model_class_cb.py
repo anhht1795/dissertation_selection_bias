@@ -42,7 +42,8 @@ class CatBoostXT_BAG:
         self,
         X: pd.DataFrame,
         y: Optional[Union[pd.Series, List, np.ndarray]] = None,
-        is_train: bool = True
+        is_train: bool = True,
+        weights: Optional[Union[pd.Series, List, np.ndarray]] = None
     ) -> Pool:
         # handle y preprocessing
         if y is not None:
@@ -60,13 +61,15 @@ class CatBoostXT_BAG:
             self.cat_features = X.select_dtypes(include=['object', 'category']).columns.tolist()
         
         # return pool object
-        return Pool(data=X, label=y, cat_features=self.cat_features)
+        return Pool(data=X, label=y, cat_features=self.cat_features, weight=weights)
     
     def fit(
         self,
         X: pd.DataFrame,
         y: Union[pd.Series, np.ndarray],
+        weights: Optional[Union[pd.Series, List, np.ndarray]] = None,
         eval_set: Optional[Tuple] = None,
+        eval_set_weights: Optional[Union[pd.Series, List, np.ndarray]] = None
     ):
         if y is not None:
             if isinstance(y, pd.Series):
@@ -78,11 +81,11 @@ class CatBoostXT_BAG:
 
         # if num_bag_folds < 2, fit only 1 model without k-fold
         if self.num_bag_folds < 2:
-            train_pool = self.prepare_data(X, y, is_train=True)
+            train_pool = self.prepare_data(X, y, is_train=True, weights=weights)
             
             # Prepare eval set if provided
             if eval_set is not None:
-                eval_pool = self.prepare_data(eval_set[0], eval_set[1], is_train=False)
+                eval_pool = self.prepare_data(eval_set[0], eval_set[1], weights=eval_set_weights, is_train=False)
             else:
                 eval_pool = None
 
@@ -118,13 +121,15 @@ class CatBoostXT_BAG:
                 #print(f"Training fold {fold + 1}/{self.num_bag_folds * self.num_bag_repeats}")
                 X_train, y_train = X.iloc[train_idx,:], y[train_idx]
                 X_val, y_val = X.iloc[val_idx,:], y[val_idx]
+                w_train = weights[train_idx] if weights is not None else None
+                w_val = weights[val_idx] if weights is not None else None
                 
-                train_pool = self.prepare_data(X_train, y_train, is_train=(fold==0))
-                val_pool = self.prepare_data(X_val, y_val, is_train=False)
+                train_pool = self.prepare_data(X_train, y_train, weights=w_train, is_train=(fold==0))
+                val_pool = self.prepare_data(X_val, y_val,  weights=w_val, is_train=False)
                 
                 # Prepare eval set if provided
                 if eval_set is not None:
-                    eval_pool = self.prepare_data(eval_set[0], eval_set[1], is_train=False)
+                    eval_pool = self.prepare_data(eval_set[0], eval_set[1], weights=eval_set_weights, is_train=False)
                 else:
                     eval_pool = None
 

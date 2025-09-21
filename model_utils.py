@@ -1,6 +1,7 @@
 import pandas as pd
 import numpy as np
-from sklearn.metrics import f1_score, accuracy_score, precision_score, recall_score, roc_curve, precision_recall_curve, roc_auc_score, confusion_matrix
+from sklearn.metrics import f1_score, accuracy_score, precision_score, recall_score, roc_curve, precision_recall_curve, roc_auc_score, confusion_matrix, average_precision_score
+import matplotlib.pyplot as plt
 
 def f_gini(y_actual, y_pred):
     """Calculate the Gini coefficient."""
@@ -137,3 +138,60 @@ def cutoff_confusion_matrix(y_true, y_score, cutoff_fraction=0.5, profit_margin=
     }
 
     return results
+
+
+# ===== Helper diagnostics for IPW =====
+def standardized_mean_diff(X_a, X_b, w_a=None, w_b=None):
+    """
+    SMD by column: (mean_a - mean_b)/pooled_sd, supports weights.
+    For categorical (0/1 dummies) works fine; for raw categoricals, use dummies first.
+    Returns a pd.Series indexed by feature name.
+    """
+    def wmean(x, w):
+        return np.average(x, weights=w) if w is not None else x.mean()
+    def wvar(x, w):
+        if w is None:
+            return x.var(ddof=1)
+        w = np.asarray(w)
+        x = np.asarray(x)
+        wm = np.average(x, weights=w)
+        return np.average((x - wm)**2, weights=w)
+    smds = {}
+    for col in X_a.columns:
+        ma = wmean(X_a[col].values, w_a)
+        mb = wmean(X_b[col].values, w_b)
+        va = wvar(X_a[col].values, w_a)
+        vb = wvar(X_b[col].values, w_b)
+        pooled_sd = np.sqrt(0.5*(va + vb) + 1e-12)
+        smds[col] = (ma - mb)/pooled_sd
+    return pd.Series(smds)
+
+def effective_sample_size(weights):
+    w = np.asarray(weights)
+    return (w.sum()**2) / (np.sum(w**2) + 1e-12)
+
+def weighted_ks_score(y_true, y_pred, sample_weight=None):
+    # Weighted KS for binary labels
+    df = pd.DataFrame({"y": y_true, "p": y_pred, "w": sample_weight if sample_weight is not None else 1.0})
+    df = df.sort_values("p")
+    w = df["w"].to_numpy()
+    y = df["y"].to_numpy()
+    w1 = np.where(y==1, w, 0)
+    w0 = np.where(y==0, w, 0)
+    cdf1 = np.cumsum(w1)/w1.sum() if w1.sum() > 0 else np.zeros_like(w1, dtype=float)
+    cdf0 = np.cumsum(w0)/w0.sum() if w0.sum() > 0 else np.zeros_like(w0, dtype=float)
+    return np.max(np.abs(cdf1 - cdf0)) if (w1.sum()>0 and w0.sum()>0) else np.nan
+
+def weighted_brier(y_true, y_prob, sample_weight=None):
+    err = (y_prob - y_true)**2
+    if sample_weight is None:
+        return err.mean()
+    w = np.asarray(sample_weight)
+    return np.average(err, weights=w)
+
+def weighted_roc_auc(y_true, y_score, sample_weight=None):
+    return roc_auc_score(y_true, y_score, sample_weight=sample_weight)
+
+def weighted_prauc(y_true, y_score, sample_weight=None):
+    # average_precision_score supports sample_weight
+    return average_precision_score(y_true, y_score, sample_weight=sample_weight)
