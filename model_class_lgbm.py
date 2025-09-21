@@ -11,6 +11,9 @@ from sklearn.metrics import RocCurveDisplay, PrecisionRecallDisplay
 from sklearn.calibration import CalibratedClassifierCV
 import matplotlib.pyplot as plt
 import shap
+from sklearn.calibration import CalibrationDisplay, calibration_curve
+from sklearn.metrics import brier_score_loss
+from sklearn.base import BaseEstimator, ClassifierMixin
 
 class LightGBMXT_BAG:
     def __init__(
@@ -33,6 +36,9 @@ class LightGBMXT_BAG:
         self.used_features = []
         self.cat_feature_indices = []
         self.cat_encoders = {}  # Store label encoders for categorical features
+        self.calibrator_ = None
+        self.calibration_method_ = None
+        self.classes_ = None
     
     def prepare_data(
         self,
@@ -174,10 +180,33 @@ class LightGBMXT_BAG:
                 )
                 
                 self.models.append(model)
-            
+        
+        self.classes_ = np.sort(np.unique(y))
+
         return self
     
     def predict_proba(
+        self,
+        X: pd.DataFrame
+    ) -> np.ndarray:
+        # Aggregate average logit of probability from all models then convert back to probability
+        X_processed, _ = self.prepare_data(X, is_train=False)
+        predictions = []
+
+        for model in self.models:
+            preds = model.predict(X_processed, num_iteration=model.best_iteration)
+            
+            # Handle binary vs multiclass predictions
+            if len(preds.shape) == 1:  # Binary classification
+                preds_proba = np.column_stack([1 - preds, preds])
+            else:  # Multiclass
+                preds_proba = preds
+            
+            predictions.append(logit(np.clip(preds_proba, 1e-15, 1-1e-15)))
+        
+        return expit(np.mean(predictions, axis=0))
+
+    def _predict_proba_raw(
         self,
         X: pd.DataFrame
     ) -> np.ndarray:
@@ -405,41 +434,186 @@ class LightGBMXT_BAG:
             'PR_AUC': pr_auc,
         }
     
-        # def a probability calibration to calibrate model predicted probabilities. return calibration object and update it to the class attribute
-    def proba_calibration(
-        self,
-        X: pd.DataFrame,
-        y: Union[pd.Series, np.ndarray],
-        method: str = 'sigmoid',
-        cv: int = 5
-    ):
-
-        # Create a calibrated classifier using the existing models
-        class EnsembleWrapper:
-            def __init__(self, models):
-                self.models = models
-            
-            def fit(self, X, y):
-                pass
-            def predict_proba(self, X):
-                # Aggregate average logit of probability from all models then convert back to probability
-                test_pool = self.prepare_data(X, is_train=False)
-                predictions = []
-
-                for model in self.models:
-                    preds = model.predict_proba(test_pool)
-                    predictions.append(logit(preds))
-                
-                return expit(np.mean(predictions, axis=0))
-            
-        ensemble_model = EnsembleWrapper(self.models)
-        calibrator = CalibratedClassifierCV(ensemble_model, method=method, cv=cv)
-        calibrator.fit(X, y)
-        self.calibrator_ = calibrator
+    def set_params(self, **params):
+        self.params.update(params)
         return self
     
-    def predict_proba_calibrated(self, X: pd.DataFrame) -> np.ndarray:
-        if hasattr(self, 'calibrator_'):
-            return self.calibrator_.predict_proba(X)
+    def get_params(self) -> Dict:
+        return self.params
+    
+    def calibrate(
+        self,
+        X_cal: pd.DataFrame,
+        y_cal: Union[pd.Series, np.ndarray, List],
+        method: str = "isotonic"  # or "sigmoid"
+    ):
+        """
+        Post-hoc probability calibration on a held-out set.
+        Saves the fitted calibrator to self.calibrator_ and method to self.calibration_method_.
+        """
+        if isinstance(y_cal, pd.Series):
+            y_cal = y_cal.values
+
+        if self.classes_ is None:
+            self.classes_ = np.sort(np.unique(y_cal))
+
+        base = _PrefitProbAdapter(self)
+        calibrator = CalibratedClassifierCV(estimator=base, method=method, cv="prefit")
+        calibrator.fit(X_cal, y_cal)
+
+        self.calibrator_ = calibrator
+        self.calibration_method_ = method
+
+        # (Optional) quick QA metrics
+        try:
+            #from sklearn.metrics import brier_score_loss, roc_auc_score
+            p_raw = self._predict_proba_raw(X_cal)[:, 1] if len(self.classes_) == 2 else None
+            p_cal = self.calibrator_.predict_proba(X_cal)[:, 1] if len(self.classes_) == 2 else None
+            if (p_raw is not None) and (p_cal is not None):
+                return {
+                    "method": method,
+                    "brier_before": float(brier_score_loss(y_cal, p_raw)),
+                    "brier_after": float(brier_score_loss(y_cal, p_cal)),
+                    "roc_auc_before": float(roc_auc_score(y_cal, p_raw)),
+                    "roc_auc_after": float(roc_auc_score(y_cal, p_cal)),
+                }
+        except Exception:
+            pass
+        return {"method": method}
+    
+    def predict_proba_calib(self, X: pd.DataFrame) -> np.ndarray:
+        return self.calibrator_.predict_proba(X)
+    
+    def plot_calibration_curve(
+        self,
+        X: pd.DataFrame,
+        y: Union[pd.Series, np.ndarray, List],
+        n_bins: int = 10,
+        strategy: str = "uniform",   # "uniform" or "quantile"
+        pos_label: int = 1,
+        use_calibrated: bool = True, # will be ignored if your predict_proba doesn't support it
+        plot_size: Tuple[int, int] = (6, 6),
+        label: Optional[str] = None,
+        ax=None,
+        return_table: bool = False
+    ):
+        """
+        Draws a reliability (calibration) curve and prints Brier score.
+        If your class has a calibrator and predict_proba(..., use_calibrated=True),
+        set use_calibrated=True to visualize post-hoc calibration.
+
+        Returns (optionally) a DataFrame with per-bin mean predicted prob and empirical rate.
+        """
+        # Ensure y is np array
+        if isinstance(y, pd.Series):
+            y = y.values
+
+        # Get probabilities; be resilient whether predict_proba supports 'use_calibrated' or not
+        if use_calibrated and (self.calibrator_ is not None):
+            proba = self.predict_proba_calib(X)[:, 1] if len(self.classes_) == 2 else None
         else:
-            raise ValueError("Model is not calibrated. Please run proba_calibration() first.")
+            proba = self.predict_proba(X)[:, 1] if len(self.classes_) == 2 else None
+
+        # Compute calibration curve data
+        frac_pos, mean_pred = calibration_curve(
+            y_true=y,
+            y_prob=proba,
+            n_bins=n_bins,
+            strategy=strategy,
+            pos_label=pos_label
+        )
+
+        # Plot
+        import matplotlib.pyplot as plt
+        if ax is None:
+            plt.figure(figsize=plot_size)
+            ax = plt.gca()
+
+        CalibrationDisplay.from_predictions(
+            y_true=y,
+            y_prob=proba,
+            n_bins=n_bins,
+            strategy=strategy,
+            pos_label=pos_label,
+            name=label if label is not None else ("Calibrated" if use_calibrated else "Uncalibrated"),
+            ax=ax
+        )
+        ax.plot([0, 1], [0, 1], linestyle="--", linewidth=1, label="Perfect")
+        ax.set_title("Calibration (Reliability) Curve")
+        ax.legend(loc="best")
+
+        # Metrics: Brier score and simple Expected Calibration Error (ECE)
+        brier = brier_score_loss(y, proba, pos_label=pos_label)
+        # ECE using the same binning as calibration_curve
+        # Build bin edges consistent with selected strategy
+        if strategy == "uniform":
+            edges = np.linspace(0, 1, n_bins + 1)
+        else:  # quantile: use percentiles of proba
+            edges = np.quantile(proba, np.linspace(0, 1, n_bins + 1))
+            edges[0], edges[-1] = 0.0, 1.0  # clamp
+
+        inds = np.digitize(proba, edges[1:-1], right=False)
+        ece = 0.0
+        total = len(proba)
+        for b in range(n_bins):
+            mask = inds == b
+            if np.any(mask):
+                p_hat = proba[mask].mean()
+                p_emp = y[mask].mean()
+                ece += (mask.sum() / total) * abs(p_emp - p_hat)
+
+        print(f"Brier score: {brier:.6f} | ECE: {ece:.6f}")
+
+        if return_table:
+            # Midpoints of bins for readability
+            bin_mid = 0.5 * (edges[:-1] + edges[1:])
+            # Map frac_pos/mean_pred (which exclude empty bins) back to non-empty bins
+            # Recompute by bin for a complete table
+            rows = []
+            for b in range(n_bins):
+                mask = inds == b
+                n_b = int(mask.sum())
+                if n_b > 0:
+                    rows.append({
+                        "bin": b + 1,
+                        "bin_left": edges[b],
+                        "bin_right": edges[b + 1],
+                        "bin_mid": bin_mid[b],
+                        "n": n_b,
+                        "mean_pred": float(proba[mask].mean()),
+                        "empirical_rate": float(y[mask].mean())
+                    })
+                else:
+                    rows.append({
+                        "bin": b + 1,
+                        "bin_left": edges[b],
+                        "bin_right": edges[b + 1],
+                        "bin_mid": bin_mid[b],
+                        "n": 0,
+                        "mean_pred": np.nan,
+                        "empirical_rate": np.nan
+                    })
+            return pd.DataFrame(rows)
+    
+
+class _PrefitProbAdapter(BaseEstimator, ClassifierMixin):
+    """Adapter that exposes predict_proba from the already-fitted ensemble."""
+    def __init__(self, outer):
+        self.outer = outer
+
+    def fit(self, X, y):
+        # CalibratedClassifierCV(cv='prefit') will call this but we do nothing.
+        return self
+
+    @property
+    def classes_(self):
+        # Prefer stored classes_ if present; otherwise fallback to LabelEncoder (if used)
+        if getattr(self.outer, "classes_", None) is not None:
+            return self.outer.classes_
+        if hasattr(self.outer, "le") and hasattr(self.outer.le, "classes_"):
+            return self.outer.le.classes_
+        return np.array([0, 1])
+
+    def predict_proba(self, X):
+        # Use the uncalibrated raw probs to avoid recursion
+        return self.outer._predict_proba_raw(X)
