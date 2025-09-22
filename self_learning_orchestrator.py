@@ -627,5 +627,33 @@ class SelfLearningOrchestrator(BaseEstimator, ClassifierMixin):
         if expect_2d:
             return np.column_stack([1 - p, p])
         return p
+    # def _safe_predict_proba(self, model, X, *args, expect_2d: bool = False, **kwargs) -> np.ndarray:
+    #     """
+    #     Return p(y=1) as 1-D array by default.
+    #     - Accepts an accidental 3rd positional bool (legacy callers) without breaking.
+    #     - If expect_2d=True, returns shape (n, 2) = [P0, P1].
+    #     """
+    #     # If a legacy caller passed a 3rd positional bool, respect it unless explicitly overridden
+    #     if args and isinstance(args[0], bool) and "expect_2d" not in kwargs:
+    #         expect_2d = bool(args[0])
+
+    #     proba = model.predict_proba(X, **kwargs)
+
+    #     # Convert to 1-D p1 if needed
+    #     if hasattr(proba, "ndim"):
+    #         if proba.ndim == 2:
+    #             p1 = proba[:, 1]
+    #         else:
+    #             p1 = np.asarray(proba)
+    #     else:
+    #         # some libs may return lists
+    #         proba = np.asarray(proba)
+    #         p1 = proba[:, 1] if proba.ndim == 2 else proba
+
+    #     if expect_2d:
+    #         return np.column_stack([1.0 - p1, p1])
+    #     return p1
+    
+
 
 
