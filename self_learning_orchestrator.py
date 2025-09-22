@@ -126,6 +126,13 @@ def build_main_learner(
     else:
         raise ValueError(f"Unknown learner: {learner}")
 
+def _to_frame(X, cols):
+    if X is None:
+        return None
+    if isinstance(X, pd.DataFrame):
+        # ensure the same column order
+        return X.loc[:, cols]
+    return pd.DataFrame(X, columns=cols)
 
 @dataclass
 class SelfLearningConfig:
@@ -234,7 +241,8 @@ class SelfLearningOrchestrator(BaseEstimator, ClassifierMixin):
 
         estimator.fit(X, y, **fit_params)
         return estimator
-    
+    # --- helpers (add inside the class or module-level) ---
+
     # -------------------------------
     # Public API
     # -------------------------------
@@ -256,11 +264,19 @@ class SelfLearningOrchestrator(BaseEstimator, ClassifierMixin):
     ) -> "SelfLearningOrchestrator":
         cfg = self.config
         rng = np.random.RandomState(cfg.random_state)
-
+        
+        # Derive canonical column order from labeled
+        if isinstance(X_l, pd.DataFrame):
+            cols = list(X_l.columns)
+        
         # Prepare containers
-        X_l = np.asarray(X_l)
         y_l = np.asarray(y_l)
-        n_l = y_l.shape[0]
+        # Coerce all X to DataFrames with identical columns/order
+        X_l  = _to_frame(X_l, cols)
+        X_u  = _to_frame(X_u, cols)        # <-- stays a DataFrame (keeps names)
+        X_val = _to_frame(X_val, cols)     # if provided
+
+        n_l = len(X_l)
         w_l = sample_weight_l if sample_weight_l is not None else np.ones(n_l, dtype=float)
 
         # If no unlabeled, just train main learner once on labeled
@@ -273,8 +289,8 @@ class SelfLearningOrchestrator(BaseEstimator, ClassifierMixin):
             self.history_.append({"round": 0, "added": 0, **self._metrics(student, X_val, y_val, sample_weight_val)})
             return self
 
-        X_u = np.asarray(X_u)
-        n_u = X_u.shape[0]
+        # X_u = np.asarray(X_u)
+        n_u = len(X_u)
         used_mask = np.zeros(n_u, dtype=bool)
 
         # Teacher starts as baseline
@@ -313,7 +329,7 @@ class SelfLearningOrchestrator(BaseEstimator, ClassifierMixin):
                 # Build a quick student from current labeled only to check agreement
                 probe_student = self._new_student()
                 self._fit_estimator(probe_student, X_l, y_l, w_l, None, None, None)
-                p_student_sub = self._safe_predict_proba(probe_student, X_u[add_idx])
+                p_student_sub = self._safe_predict_proba(probe_student, X_u.iloc[add_idx])
                 p_teacher_sub = p_teacher[add_idx]
                 agree = np.abs(p_teacher_sub - p_student_sub) <= cfg.agreement_tol
                 add_idx = add_idx[agree]
@@ -332,8 +348,9 @@ class SelfLearningOrchestrator(BaseEstimator, ClassifierMixin):
                     w_pseudo = 0.5 * np.maximum(conf, cfg.confidence_floor)
 
                 # 4) Merge labeled + pseudo-labeled
-                X_pseudo = X_u[add_idx]
-                X_merge = np.vstack([X_l, X_pseudo])
+                X_pseudo = X_u.iloc[add_idx]  
+                X_merge = pd.concat([X_l, X_pseudo], axis=0, ignore_index=True)
+
                 y_merge = np.concatenate([y_l, y_pseudo])
                 w_merge = np.concatenate([w_l, w_pseudo])
             else:
