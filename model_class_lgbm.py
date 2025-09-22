@@ -121,12 +121,12 @@ class LightGBMXT_BAG:
                 self.params.update({'objective': 'multiclass', 'metric': 'multi_logloss', 'num_class': len(np.unique(y))})
 
             # Create LightGBM dataset
-            train_data = lgb.Dataset(X_processed, label=y_processed, categorical_feature=self.cat_feature_indices, weights=weights)
+            train_data = lgb.Dataset(X_processed, label=y_processed, categorical_feature=self.cat_feature_indices, weight=weights)
             # Prepare eval set if provided
             if eval_set is not None:
                 X_eval, y_eval = self.prepare_data(eval_set[0], eval_set[1], is_train=False)
                 # eval_data = [(X_eval, y_eval)]
-                evat_dataset = lgb.Dataset(X_eval, label=y_eval, categorical_feature=self.cat_feature_indices,reference=train_data, weights=eval_set_weights)
+                evat_dataset = lgb.Dataset(X_eval, label=y_eval, categorical_feature=self.cat_feature_indices,reference=train_data, weight=eval_set_weights)
             else:
                 evat_dataset = None
             
@@ -157,13 +157,13 @@ class LightGBMXT_BAG:
                 w_val = weights[val_idx] if weights is not None else None
                 
                 # Create LightGBM datasets
-                train_data = lgb.Dataset(X_train_processed, label=y_train_processed, categorical_feature=self.cat_feature_indices, weights=w_train)
-                val_data = lgb.Dataset(X_val_processed, label=y_val_processed, categorical_feature=self.cat_feature_indices, reference=train_data, weights=w_val)
+                train_data = lgb.Dataset(X_train_processed, label=y_train_processed, categorical_feature=self.cat_feature_indices, weight=w_train)
+                val_data = lgb.Dataset(X_val_processed, label=y_val_processed, categorical_feature=self.cat_feature_indices, reference=train_data, weight=w_val)
                 
                 # Prepare eval set if provided
                 if eval_set is not None:
                     X_eval, y_eval = self.prepare_data(eval_set[0], eval_set[1], is_train=False)
-                    eval_data = lgb.Dataset(X_eval, label=y_eval, categorical_feature=self.cat_feature_indices, reference=train_data, weights=eval_set_weights)
+                    eval_data = lgb.Dataset(X_eval, label=y_eval, categorical_feature=self.cat_feature_indices, reference=train_data, weight=eval_set_weights)
                 else:
                     eval_data = val_data
 

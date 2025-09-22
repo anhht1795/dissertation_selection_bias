@@ -85,7 +85,7 @@ from sklearn.naive_bayes import GaussianNB, BernoulliNB
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.metrics import roc_auc_score, brier_score_loss
 from sklearn.utils.validation import check_is_fitted
-
+from typing import Optional, Tuple, Literal, Dict, Any, List, Callable, Union
 
 LearnerName = Literal["logit", "gnb", "bnb"]
 
@@ -133,9 +133,26 @@ class SelfLearningConfig:
     n_rounds: int = 2
     main_learner_name: LearnerName = "logit"
     main_learner_kwargs: Optional[Dict[str, Any]] = None
+    main_learner_factory: Optional[Callable[[], Any]] = None
+    # If None, auto-detect whether to pass 'sample_weight' or 'weights' into .fit()
+    main_fit_weight_arg: Optional[str] = None
 
     # Selection thresholds per round; cycled if shorter than n_rounds
     teacher_thresholds: Optional[List[Tuple[float, float]]] = None  # list of (t_pos, t_neg)
+
+    # --- Thresholding mode ---
+    # "absolute" (use teacher_thresholds), "percentile", or "precision" (Option C)
+    threshold_mode: Literal["absolute", "percentile", "precision"] = "percentile"
+
+    # For percentile mode (optional; cycles by round if shorter)
+    percentile_pairs: Optional[List[Tuple[float, float]]] = None  # e.g., [(0.96, 0.04)]
+
+    # For precision-targeting mode (Option C)
+    target_precision_pos: float = 0.92   # desired P(y=1 | p >= t_pos) on X_val
+    target_precision_neg: float = 0.92   # desired P(y=0 | p <= t_neg) on X_val
+    min_val_support: int = 150           # require at least this many val samples in each tail
+    abs_floor_hi: Optional[float] = 0.90 # optional absolute floor for t_pos (None to disable)
+    abs_floor_lo: Optional[float] = 0.10 # optional absolute ceiling for t_neg (None to disable)
 
     # Capacity controls per (sub)round
     max_add_per_round: int = 20000
@@ -176,6 +193,48 @@ class SelfLearningOrchestrator(BaseEstimator, ClassifierMixin):
         self.history_: List[Dict[str, Any]] = []
         self._is_fitted = False
 
+    def _new_student(self):
+        cfg = self.config
+        if cfg.main_learner_factory is not None:
+            return cfg.main_learner_factory()
+        return build_main_learner(cfg.main_learner_name, cfg.random_state, **(cfg.main_learner_kwargs or {}))
+
+    def _fit_estimator(
+        self,
+        estimator: Any,
+        X,
+        y,
+        w: Optional[np.ndarray],
+        X_val: Optional[Union[np.ndarray, pd.DataFrame]],
+        y_val: Optional[Union[np.ndarray, pd.Series]],
+        w_val: Optional[np.ndarray],
+    ) -> Any:
+        """
+        Fit with flexible signatures to support custom classes (e.g., CatBoostXT_BAG).
+        Automatically passes weights as 'sample_weight' or 'weights' and uses eval_set if supported.
+        """
+        import inspect
+        fit_sig = inspect.signature(estimator.fit)
+        fit_params: Dict[str, Any] = {}
+
+        # Weight argument
+        if self.config.main_fit_weight_arg is not None:
+            fit_params[self.config.main_fit_weight_arg] = w
+        else:
+            if "sample_weight" in fit_sig.parameters:
+                fit_params["sample_weight"] = w
+            elif "weights" in fit_sig.parameters:
+                fit_params["weights"] = w
+
+        # Eval-set arguments
+        if "eval_set" in fit_sig.parameters and (X_val is not None and y_val is not None):
+            fit_params["eval_set"] = (X_val, y_val)
+            if "eval_set_weights" in fit_sig.parameters and (w_val is not None):
+                fit_params["eval_set_weights"] = w_val
+
+        estimator.fit(X, y, **fit_params)
+        return estimator
+    
     # -------------------------------
     # Public API
     # -------------------------------
@@ -183,14 +242,14 @@ class SelfLearningOrchestrator(BaseEstimator, ClassifierMixin):
         self,
         *,
         baseline_teacher: BaseEstimator,
-        X_l: np.ndarray | pd.DataFrame,
-        y_l: np.ndarray | pd.Series,
-        X_u: Optional[np.ndarray | pd.DataFrame] = None,
+        X_l: Optional[Union[np.ndarray, pd.DataFrame]],
+        y_l: Optional[Union[np.ndarray, pd.Series]],
+        X_u: Optional[Union[np.ndarray, pd.DataFrame]] = None,
         # weights for labeled accepted rows
         sample_weight_l: Optional[np.ndarray] = None,
         # optional validation for monitoring/calibration
-        X_val: Optional[np.ndarray | pd.DataFrame] = None,
-        y_val: Optional[np.ndarray | pd.Series] = None,
+        X_val: Optional[Union[np.ndarray, pd.DataFrame]] = None,
+        y_val: Optional[Union[np.ndarray, pd.Series]] = None,
         sample_weight_val: Optional[np.ndarray] = None,
         # optional acceptance propensity for rejects to weight pseudo-labels
         propensity_u: Optional[np.ndarray] = None,
@@ -206,8 +265,8 @@ class SelfLearningOrchestrator(BaseEstimator, ClassifierMixin):
 
         # If no unlabeled, just train main learner once on labeled
         if X_u is None:
-            student = build_main_learner(cfg.main_learner_name, cfg.random_state, **(cfg.main_learner_kwargs or {}))
-            student.fit(X_l, y_l, sample_weight=w_l)
+            student = self._new_student()
+            self._fit_estimator(student, X_l, y_l, w_l, X_val, y_val, sample_weight_val)
             student = self._maybe_calibrate(student, X_val, y_val, sample_weight_val)
             self.model_ = student
             self._is_fitted = True
@@ -221,7 +280,11 @@ class SelfLearningOrchestrator(BaseEstimator, ClassifierMixin):
         # Teacher starts as baseline
         teacher = baseline_teacher
 
-        # Track best per round
+        # Track best across rounds (early stop on validation)
+        best_score = -np.inf if cfg.early_stop_metric == "auc" else np.inf
+        best_model = None
+        no_improve = 0
+
         for r in range(cfg.n_rounds):
             t_pos, t_neg = self._threshold_for_round(r)
 
@@ -236,8 +299,8 @@ class SelfLearningOrchestrator(BaseEstimator, ClassifierMixin):
 
             if add_idx.size == 0:
                 # nothing to add; proceed to just retrain on labeled (no change)
-                student = build_main_learner(cfg.main_learner_name, cfg.random_state, **(cfg.main_learner_kwargs or {}))
-                student.fit(X_l, y_l, sample_weight=w_l)
+                student = self._new_student()
+                self._fit_estimator(student, X_l, y_l, w_l, X_val, y_val, sample_weight_val)
                 student = self._maybe_calibrate(student, X_val, y_val, sample_weight_val)
                 self.model_ = student
                 self._is_fitted = True
@@ -248,8 +311,8 @@ class SelfLearningOrchestrator(BaseEstimator, ClassifierMixin):
             # Optional agreement (only in early rounds)
             if r < cfg.require_agreement_rounds:
                 # Build a quick student from current labeled only to check agreement
-                probe_student = build_main_learner(cfg.main_learner_name, cfg.random_state, **(cfg.main_learner_kwargs or {}))
-                probe_student.fit(X_l, y_l, sample_weight=w_l)
+                probe_student = self._new_student()
+                self._fit_estimator(probe_student, X_l, y_l, w_l, None, None, None)
                 p_student_sub = self._safe_predict_proba(probe_student, X_u[add_idx])
                 p_teacher_sub = p_teacher[add_idx]
                 agree = np.abs(p_teacher_sub - p_student_sub) <= cfg.agreement_tol
@@ -277,29 +340,52 @@ class SelfLearningOrchestrator(BaseEstimator, ClassifierMixin):
                 X_merge, y_merge, w_merge = X_l, y_l, w_l
 
             # 5) Train student from scratch
-            student = build_main_learner(cfg.main_learner_name, cfg.random_state, **(cfg.main_learner_kwargs or {}))
-            student.fit(X_merge, y_merge, sample_weight=w_merge)
+            student = self._new_student()
+            self._fit_estimator(student, X_merge, y_merge, w_merge, X_val, y_val, sample_weight_val)
 
             # 6) Optional calibration on validation
             student = self._maybe_calibrate(student, X_val, y_val, sample_weight_val)
 
-            # Record & advance
-            self.history_.append({
+            # Record metrics
+            round_metrics = {
                 "round": r,
                 "added": int(add_idx.size),
                 "t_pos": t_pos,
                 "t_neg": t_neg,
                 **self._metrics(student, X_val, y_val, sample_weight_val),
-            })
+            }
+            self.history_.append(round_metrics)
 
             # Mark used
             if add_idx.size > 0:
                 used_mask[add_idx] = True
 
-            # Early stop logic per round (optional)
-            # We simply keep the latest student per round; you can swap to a more complex per-epoch criterion if needed.
+            # --- Early stopping across rounds ---
+            # Define a scalar score depending on metric
+            cur_score = (
+                round_metrics["auc"] if cfg.early_stop_metric == "auc" else -round_metrics["brier"]
+            )
+            improved = False
+            if np.isfinite(cur_score):
+                if cfg.early_stop_metric == "auc":
+                    if cur_score > best_score:
+                        improved = True
+                else:  # brier (lower is better) => -brier higher is better
+                    if cur_score > best_score:
+                        improved = True
+            if improved:
+                best_score = cur_score
+                best_model = student
+                no_improve = 0
+            else:
+                no_improve += 1
+                if no_improve >= cfg.early_stop_patience:
+                    # finalize with best_model if available
+                    self.model_ = best_model if best_model is not None else student
+                    self._is_fitted = True
+                    return self
 
-            # Set student as new teacher for next round
+            # Promote student to teacher for next round
             teacher = student
 
         # Final model is the last student
@@ -362,16 +448,145 @@ class SelfLearningOrchestrator(BaseEstimator, ClassifierMixin):
         conf = np.maximum(p_teacher[add_idx], 1 - p_teacher[add_idx])
         return add_idx, y_pseudo, conf
 
+    def _thresholds_for_round(
+        self,
+        r: int,
+        teacher: BaseEstimator,
+        X_u: np.ndarray,
+        used_mask: np.ndarray,
+        X_val: Optional[np.ndarray],
+        y_val: Optional[np.ndarray],
+    ) -> Tuple[float, float, str, Dict[str, float]]:
+        """
+        Returns (t_pos, t_neg, mode_used, extras) where mode_used is one of
+        {"absolute","percentile","precision"} and extras logs diagnostics.
+        """
+        cfg = self.config
+        mode = cfg.threshold_mode
+
+        # Common: teacher scores on rejects for percentile mode
+        p_u = None
+        if mode == "percentile":
+            p_u = self._safe_predict_proba(teacher, X_u)
+
+        # Common: teacher scores on validation for precision mode
+        p_val = None
+        if mode == "precision":
+            if X_val is None or y_val is None:
+                # Fallback to absolute if no val provided
+                mode = "absolute"
+            else:
+                p_val = self._safe_predict_proba(teacher, X_val)
+
+        # --- Absolute (default/backstop)
+        if mode == "absolute":
+            if not cfg.teacher_thresholds:
+                return 0.96, 0.04, "absolute", {}
+            t_pos, t_neg = cfg.teacher_thresholds[r % len(cfg.teacher_thresholds)]
+            return float(t_pos), float(t_neg), "absolute", {}
+
+        # --- Percentile
+        if mode == "percentile":
+            if not cfg.percentile_pairs:
+                hi_q, lo_q = 0.96, 0.04
+            else:
+                hi_q, lo_q = cfg.percentile_pairs[r % len(cfg.percentile_pairs)]
+            avail = ~used_mask
+            t_pos = float(np.quantile(p_u[avail], hi_q))
+            t_neg = float(np.quantile(p_u[avail], lo_q))
+            return t_pos, t_neg, "percentile", {"t_pos_abs": t_pos, "t_neg_abs": t_neg}
+
+        # --- Precision-targeting (Option C)
+        # Find the smallest t_pos s.t. precision_pos >= target and support >= min_val_support
+        # and the largest t_neg s.t. precision_neg >= target and support >= min_val_support
+        t_pos, prec_pos, n_pos = self._pick_threshold_by_precision(
+            p_val, y_val, target=cfg.target_precision_pos, side="high", min_support=cfg.min_val_support
+        )
+        t_neg, prec_neg, n_neg = self._pick_threshold_by_precision(
+            p_val, y_val, target=cfg.target_precision_neg, side="low",  min_support=cfg.min_val_support
+        )
+
+        # Optional absolute floors/ceilings
+        if cfg.abs_floor_hi is not None:
+            t_pos = max(t_pos, cfg.abs_floor_hi)
+        if cfg.abs_floor_lo is not None:
+            t_neg = min(t_neg, cfg.abs_floor_lo)
+
+        extras = {
+            "t_pos_abs": float(t_pos),
+            "t_neg_abs": float(t_neg),
+            "prec_val_pos": float(prec_pos) if np.isfinite(prec_pos) else np.nan,
+            "prec_val_neg": float(prec_neg) if np.isfinite(prec_neg) else np.nan,
+            "n_val_pos": int(n_pos),
+            "n_val_neg": int(n_neg),
+        }
+        return float(t_pos), float(t_neg), "precision", extras
+
+
+    @staticmethod
+    def _pick_threshold_by_precision(
+        p: np.ndarray,
+        y: np.ndarray,
+        target: float,
+        side: Literal["high", "low"],
+        min_support: int = 150,
+    ) -> Tuple[float, float, int]:
+        """
+        Returns (threshold, achieved_precision, support).
+        - side="high": sweep t from high to low; choose smallest t with P(y=1|p>=t) >= target and count>=min_support.
+        - side="low" : sweep t from low  to high; choose largest t with P(y=0|p<=t) >= target and count>=min_support.
+        If no threshold meets target+support, falls back to the extreme (0.99 for high / 0.01 for low) that maximizes precision.
+        """
+        sort_idx = np.argsort(p)
+        if side == "high":
+            # descending thresholds
+            uniq = np.unique(p[sort_idx])[::-1]
+            best_t, best_prec, best_n = 0.99, -np.inf, 0
+            for t in uniq:
+                mask = p >= t
+                n = int(mask.sum())
+                if n < min_support:
+                    continue
+                prec = float((y[mask] == 1).mean())
+                if prec >= target:
+                    return float(t), prec, n
+                if prec > best_prec:
+                    best_prec, best_t, best_n = prec, t, n
+            return float(best_t), best_prec, best_n
+        else:
+            # side == "low": ascending thresholds
+            uniq = np.unique(p[sort_idx])
+            best_t, best_prec, best_n = 0.01, -np.inf, 0
+            for t in uniq:
+                mask = p <= t
+                n = int(mask.sum())
+                if n < min_support:
+                    continue
+                prec = float((y[mask] == 0).mean())
+                if prec >= target:
+                    return float(t), prec, n
+                if prec > best_prec:
+                    best_prec, best_t, best_n = prec, t, n
+            return float(best_t), best_prec, best_n
+
+
     def _maybe_calibrate(
         self,
         estimator: BaseEstimator,
-        X_val: Optional[np.ndarray | pd.DataFrame],
-        y_val: Optional[np.ndarray | pd.Series],
+        X_val: Optional[Union[np.ndarray, pd.DataFrame]],
+        y_val: Optional[Union[np.ndarray, pd.Series]],
         sample_weight_val: Optional[np.ndarray] = None,
     ) -> BaseEstimator:
         cfg = self.config
         if cfg.calibrate is None or X_val is None or y_val is None:
             return estimator
+        if hasattr(estimator, "calibrate"):
+            try:
+                estimator.calibrate(X_val, y_val, method=cfg.calibrate)
+                return estimator
+            except Exception:
+                pass
+        # fallback
         calibrator = CalibratedClassifierCV(
             base_estimator=estimator,
             method=cfg.calibrate,
@@ -383,8 +598,8 @@ class SelfLearningOrchestrator(BaseEstimator, ClassifierMixin):
     def _metrics(
         self,
         estimator: BaseEstimator,
-        X_val: Optional[np.ndarray | pd.DataFrame],
-        y_val: Optional[np.ndarray | pd.Series],
+        X_val: Optional[Union[np.ndarray, pd.DataFrame]],
+        y_val: Optional[Union[np.ndarray, pd.Series]],
         sample_weight_val: Optional[np.ndarray] = None,
     ) -> Dict[str, float]:
         if X_val is None or y_val is None:
@@ -412,3 +627,5 @@ class SelfLearningOrchestrator(BaseEstimator, ClassifierMixin):
         if expect_2d:
             return np.column_stack([1 - p, p])
         return p
+
+

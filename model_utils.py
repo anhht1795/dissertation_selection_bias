@@ -2,6 +2,7 @@ import pandas as pd
 import numpy as np
 from sklearn.metrics import f1_score, accuracy_score, precision_score, recall_score, roc_curve, precision_recall_curve, roc_auc_score, confusion_matrix, average_precision_score
 import matplotlib.pyplot as plt
+from typing import Optional, Tuple, Literal, Dict, Any, List, Callable
 
 def f_gini(y_actual, y_pred):
     """Calculate the Gini coefficient."""
@@ -195,3 +196,72 @@ def weighted_roc_auc(y_true, y_score, sample_weight=None):
 def weighted_prauc(y_true, y_score, sample_weight=None):
     # average_precision_score supports sample_weight
     return average_precision_score(y_true, y_score, sample_weight=sample_weight)
+
+def tail_precision(
+    p: np.ndarray,
+    y: np.ndarray,
+    mode: str = "absolute",          # "absolute" or "percentile"
+    hi: float = 0.96,
+    lo: float = 0.04,
+    sample_weight: np.ndarray = None
+):
+    """
+    Compute precision in the high and low probability tails.
+
+    Parameters
+    ----------
+    p : array-like
+        Predicted probabilities for y=1.
+    y : array-like
+        True binary labels {0,1}.
+    mode : {"absolute","percentile"}
+        - "absolute": use hi/lo as probability cutoffs (e.g., 0.96 / 0.04)
+        - "percentile": use hi/lo as quantiles of p (e.g., 0.96 -> 96th percentile)
+    hi, lo : float
+        Thresholds interpreted per 'mode'.
+    sample_weight : array-like or None
+        Optional weights for precision calculation.
+
+    Returns
+    -------
+    prec_pos, prec_neg, n_pos, n_neg, t_pos_abs, t_neg_abs
+        Precision in the high tail, precision in the low tail,
+        counts in each tail, and the absolute probability cutoffs used.
+    """
+    p = np.asarray(p)
+    y = np.asarray(y)
+
+    # Determine absolute thresholds
+    if mode == "absolute":
+        t_pos_abs, t_neg_abs = float(hi), float(lo)
+    elif mode == "percentile":
+        t_pos_abs = float(np.quantile(p, hi))
+        t_neg_abs = float(np.quantile(p, lo))
+    else:
+        raise ValueError("mode must be 'absolute' or 'percentile'")
+
+    pos_mask = (p >= t_pos_abs)
+    neg_mask = (p <= t_neg_abs)
+
+    def _wmean(mask, positive=True):
+        n = int(mask.sum())
+        if n == 0:
+            return float("nan"), n
+        if sample_weight is None:
+            if positive:
+                return float((y[mask] == 1).mean()), n
+            else:
+                return float((y[mask] == 0).mean()), n
+        # weighted precision
+        w = np.asarray(sample_weight)[mask]
+        if positive:
+            num = (w * (y[mask] == 1)).sum()
+        else:
+            num = (w * (y[mask] == 0)).sum()
+        den = w.sum()
+        return float(num / den) if den > 0 else float("nan"), n
+
+    prec_pos, n_pos = _wmean(pos_mask, positive=True)
+    prec_neg, n_neg = _wmean(neg_mask, positive=False)
+
+    return prec_pos, prec_neg, n_pos, n_neg, t_pos_abs, t_neg_abs
