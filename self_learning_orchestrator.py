@@ -83,7 +83,7 @@ from sklearn.base import BaseEstimator, ClassifierMixin, clone
 from sklearn.linear_model import LogisticRegression
 from sklearn.naive_bayes import GaussianNB, BernoulliNB
 from sklearn.calibration import CalibratedClassifierCV
-from sklearn.metrics import roc_auc_score, brier_score_loss
+from sklearn.metrics import roc_auc_score, brier_score_loss, precision_recall_curve
 from sklearn.utils.validation import check_is_fitted
 from typing import Optional, Tuple, Literal, Dict, Any, List, Callable, Union
 
@@ -627,10 +627,15 @@ class SelfLearningOrchestrator(BaseEstimator, ClassifierMixin):
         except Exception:
             auc = np.nan
         try:
+            precision, recall, thresholds = precision_recall_curve(y_actual, y_pred)
+            pr_auc = np.trapz(precision, recall)
+        except Exception:
+            pr_auc = np.nan
+        try:
             brier = brier_score_loss(y_val, p, sample_weight=sample_weight_val)
         except Exception:
             brier = np.nan
-        return {"auc": float(auc), "brier": float(brier)}
+        return {"auc": float(auc), "pr_auc": float(pr_auc), "brier": float(brier)}
 
     @staticmethod
     def _safe_predict_proba(model: BaseEstimator, X, expect_2d: bool = False) -> np.ndarray:
