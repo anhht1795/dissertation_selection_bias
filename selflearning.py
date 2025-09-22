@@ -1,0 +1,414 @@
+"""
+Self-learning Orchestrator (teacher→student→teacher ...)
+=====================================================
+
+This module implements a **round-based self/augmented learning** pipeline that:
+
+1) Takes a **baseline teacher model** (e.g., your CatBoost 71% AUC),
+2) Harvests **high-confidence pseudo-labels** on the unlabeled pool,
+3) Trains/updates a **main learner** (weak learner: logistic / Naive Bayes),
+4) **Swaps roles** so the main learner becomes the **teacher** in the next round,
+5) Repeats for `n_rounds`.
+
+Key design goals
+----------------
+- Modular, dependency-light (scikit-learn, numpy, pandas).
+- IPW support on labeled data **and** capped 1/propensity weights for pseudo-labeled rejects.
+- Confidence & capacity controls per round (thresholds, max additions, min additions).
+- Optional agreement gate (teacher vs previous student) in early rounds.
+- Optional probability calibration on a validation set.
+
+Typical usage
+-------------
+```python
+from self_learning_orchestrator import (
+    SelfLearningConfig,
+    SelfLearningOrchestrator,
+    build_main_learner
+)
+
+# Labeled (accepted) and unlabeled (rejected)
+X_l, y_l = ...
+X_u = ...
+ipw_l = ...                 # 1 / P(accept|x) for accepted rows (optional)
+prop_u = ...                # P(accept|x) for rejects (optional but recommended)
+
+# Provide a trained baseline teacher (e.g., CatBoost/LightGBM/Logit with predict_proba)
+baseline_teacher = ...      # must implement predict_proba(X) -> [:,1]
+
+# Validation split from accepted for monitoring/calibration
+X_val, y_val, w_val = ...   # optional but recommended
+
+cfg = SelfLearningConfig(
+    n_rounds=3,                         # teacher→student→teacher (3 rounds)
+    main_learner_name="logit",         # "logit" | "gnb" | "bnb"
+    teacher_thresholds=[(0.96, 0.04),   # per-round (pos, neg) thresholds; will be cycled if shorter
+                        (0.94, 0.06)],
+    max_add_per_round=20000,
+    min_new_per_round=500,
+    use_propensity_weight=True,
+    cap_ipw=20.0,
+    require_agreement_rounds=1,         # only in round 1 (0-indexed)
+    agreement_tol=0.15,
+    calibrate="sigmoid",               # None | "sigmoid" | "isotonic"
+    early_stop_metric="auc",           # "auc" or "brier"
+    early_stop_patience=2,
+    main_learner_kwargs=dict(C=0.5, solver="liblinear", max_iter=200, class_weight="balanced"),
+    random_state=42,
+)
+
+orch = SelfLearningOrchestrator(cfg)
+orch.fit(
+    baseline_teacher=baseline_teacher,
+    X_l=X_l, y_l=y_l, sample_weight_l=ipw_l,
+    X_u=X_u, propensity_u=prop_u,
+    X_val=X_val, y_val=y_val, sample_weight_val=w_val,
+)
+
+# Final model for inference on new applicants
+p = orch.predict_proba(X_new)[:, 1]
+
+# Inspect training dynamics
+print(orch.get_history())
+```
+"""
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import Optional, Tuple, Literal, Dict, Any, List
+
+import numpy as np
+import pandas as pd
+
+from sklearn.base import BaseEstimator, ClassifierMixin, clone
+from sklearn.linear_model import LogisticRegression
+from sklearn.naive_bayes import GaussianNB, BernoulliNB
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.metrics import roc_auc_score, brier_score_loss
+from sklearn.utils.validation import check_is_fitted
+
+
+LearnerName = Literal["logit", "gnb", "bnb"]
+
+
+def build_main_learner(
+    learner: LearnerName,
+    random_state: int = 42,
+    **kwargs,
+) -> BaseEstimator:
+    """Factory for the main (weak) learner.
+
+    - logit: Logistic Regression (L2) — good all-round weak learner.
+    - gnb  : Gaussian Naive Bayes — fast, assumes per-class Gaussian features.
+    - bnb  : Bernoulli Naive Bayes — for binary indicator features.
+    """
+    if learner == "logit":
+        C = kwargs.pop("C", 0.5)
+        solver = kwargs.pop("solver", "liblinear")
+        max_iter = kwargs.pop("max_iter", 200)
+        class_weight = kwargs.pop("class_weight", "balanced")
+        return LogisticRegression(
+            C=C,
+            solver=solver,
+            max_iter=max_iter,
+            class_weight=class_weight,
+            random_state=random_state,
+            n_jobs=kwargs.pop("n_jobs", None),
+            **kwargs,
+        )
+    elif learner == "gnb":
+        return GaussianNB(var_smoothing=kwargs.pop("var_smoothing", 1e-9))
+    elif learner == "bnb":
+        return BernoulliNB(
+            alpha=kwargs.pop("alpha", 1.0),
+            binarize=kwargs.pop("binarize", None),
+            fit_prior=kwargs.pop("fit_prior", True),
+        )
+    else:
+        raise ValueError(f"Unknown learner: {learner}")
+
+
+@dataclass
+class SelfLearningConfig:
+    # Orchestration
+    n_rounds: int = 2
+    main_learner_name: LearnerName = "logit"
+    main_learner_kwargs: Optional[Dict[str, Any]] = None
+
+    # Selection thresholds per round; cycled if shorter than n_rounds
+    teacher_thresholds: Optional[List[Tuple[float, float]]] = None  # list of (t_pos, t_neg)
+
+    # Capacity controls per (sub)round
+    max_add_per_round: int = 20000
+    min_new_per_round: int = 500
+
+    # Weighting
+    use_propensity_weight: bool = True
+    cap_ipw: float = 20.0
+
+    # Agreement (teacher vs previous student) only in early rounds
+    require_agreement_rounds: int = 1  # how many initial rounds to enforce agreement
+    agreement_tol: float = 0.15
+    confidence_floor: float = 0.5
+
+    # Calibration & early stopping on validation
+    calibrate: Optional[Literal["sigmoid", "isotonic"]] = None
+    early_stop_metric: Literal["auc", "brier"] = "auc"
+    early_stop_patience: int = 2
+
+    # Misc
+    random_state: int = 42
+
+
+class SelfLearningOrchestrator(BaseEstimator, ClassifierMixin):
+    """Round-based self-learning orchestrator.
+
+    Workflow per round r = 1..n_rounds:
+      1) Use current teacher (baseline for r=1, then last student) to score X_u.
+      2) Harvest confident positives/negatives with (t_pos, t_neg), capped by max_add_per_round.
+      3) Compute pseudo-label weights; merge with labeled set (with optional IPW).
+      4) Train a fresh main learner (weak learner) from scratch on the merged set.
+      5) Optionally calibrate on validation; update history; set this learner as teacher for next round.
+    """
+
+    def __init__(self, config: SelfLearningConfig = SelfLearningConfig()):
+        self.config = config
+        self.model_: Optional[BaseEstimator] = None  # final calibrated student
+        self.history_: List[Dict[str, Any]] = []
+        self._is_fitted = False
+
+    # -------------------------------
+    # Public API
+    # -------------------------------
+    def fit(
+        self,
+        *,
+        baseline_teacher: BaseEstimator,
+        X_l: np.ndarray | pd.DataFrame,
+        y_l: np.ndarray | pd.Series,
+        X_u: Optional[np.ndarray | pd.DataFrame] = None,
+        # weights for labeled accepted rows
+        sample_weight_l: Optional[np.ndarray] = None,
+        # optional validation for monitoring/calibration
+        X_val: Optional[np.ndarray | pd.DataFrame] = None,
+        y_val: Optional[np.ndarray | pd.Series] = None,
+        sample_weight_val: Optional[np.ndarray] = None,
+        # optional acceptance propensity for rejects to weight pseudo-labels
+        propensity_u: Optional[np.ndarray] = None,
+    ) -> "SelfLearningOrchestrator":
+        cfg = self.config
+        rng = np.random.RandomState(cfg.random_state)
+
+        # Prepare containers
+        X_l = np.asarray(X_l)
+        y_l = np.asarray(y_l)
+        n_l = y_l.shape[0]
+        w_l = sample_weight_l if sample_weight_l is not None else np.ones(n_l, dtype=float)
+
+        # If no unlabeled, just train main learner once on labeled
+        if X_u is None:
+            student = build_main_learner(cfg.main_learner_name, cfg.random_state, **(cfg.main_learner_kwargs or {}))
+            student.fit(X_l, y_l, sample_weight=w_l)
+            student = self._maybe_calibrate(student, X_val, y_val, sample_weight_val)
+            self.model_ = student
+            self._is_fitted = True
+            self.history_.append({"round": 0, "added": 0, **self._metrics(student, X_val, y_val, sample_weight_val)})
+            return self
+
+        X_u = np.asarray(X_u)
+        n_u = X_u.shape[0]
+        used_mask = np.zeros(n_u, dtype=bool)
+
+        # Teacher starts as baseline
+        teacher = baseline_teacher
+
+        # Track best per round
+        for r in range(cfg.n_rounds):
+            t_pos, t_neg = self._threshold_for_round(r)
+
+            # 1) Score all remaining unlabeled with current teacher
+            p_teacher = self._safe_predict_proba(teacher, X_u)  # [:,1]
+
+            # 2) Harvest confident candidates
+            add_idx, y_pseudo, conf = self._harvest(
+                p_teacher, used_mask, t_pos, t_neg,
+                cfg.max_add_per_round, cfg.min_new_per_round,
+            )
+
+            if add_idx.size == 0:
+                # nothing to add; proceed to just retrain on labeled (no change)
+                student = build_main_learner(cfg.main_learner_name, cfg.random_state, **(cfg.main_learner_kwargs or {}))
+                student.fit(X_l, y_l, sample_weight=w_l)
+                student = self._maybe_calibrate(student, X_val, y_val, sample_weight_val)
+                self.model_ = student
+                self._is_fitted = True
+                self.history_.append({"round": r, "added": 0, **self._metrics(student, X_val, y_val, sample_weight_val)})
+                teacher = student  # next round uses student as teacher
+                continue
+
+            # Optional agreement (only in early rounds)
+            if r < cfg.require_agreement_rounds:
+                # Build a quick student from current labeled only to check agreement
+                probe_student = build_main_learner(cfg.main_learner_name, cfg.random_state, **(cfg.main_learner_kwargs or {}))
+                probe_student.fit(X_l, y_l, sample_weight=w_l)
+                p_student_sub = self._safe_predict_proba(probe_student, X_u[add_idx])
+                p_teacher_sub = p_teacher[add_idx]
+                agree = np.abs(p_teacher_sub - p_student_sub) <= cfg.agreement_tol
+                add_idx = add_idx[agree]
+                y_pseudo = y_pseudo[agree]
+                conf = conf[agree]
+                if add_idx.size < cfg.min_new_per_round:
+                    # too few after agreement gate: skip pseudo-add this round
+                    add_idx = np.array([], dtype=int)
+
+            # 3) Compute pseudo-weights
+            if add_idx.size > 0:
+                if cfg.use_propensity_weight and (propensity_u is not None):
+                    prop = np.clip(propensity_u[add_idx].astype(float), 1e-6, np.inf)
+                    w_pseudo = np.clip((1.0 / prop) * np.maximum(conf, cfg.confidence_floor), 0.0, cfg.cap_ipw)
+                else:
+                    w_pseudo = 0.5 * np.maximum(conf, cfg.confidence_floor)
+
+                # 4) Merge labeled + pseudo-labeled
+                X_pseudo = X_u[add_idx]
+                X_merge = np.vstack([X_l, X_pseudo])
+                y_merge = np.concatenate([y_l, y_pseudo])
+                w_merge = np.concatenate([w_l, w_pseudo])
+            else:
+                X_merge, y_merge, w_merge = X_l, y_l, w_l
+
+            # 5) Train student from scratch
+            student = build_main_learner(cfg.main_learner_name, cfg.random_state, **(cfg.main_learner_kwargs or {}))
+            student.fit(X_merge, y_merge, sample_weight=w_merge)
+
+            # 6) Optional calibration on validation
+            student = self._maybe_calibrate(student, X_val, y_val, sample_weight_val)
+
+            # Record & advance
+            self.history_.append({
+                "round": r,
+                "added": int(add_idx.size),
+                "t_pos": t_pos,
+                "t_neg": t_neg,
+                **self._metrics(student, X_val, y_val, sample_weight_val),
+            })
+
+            # Mark used
+            if add_idx.size > 0:
+                used_mask[add_idx] = True
+
+            # Early stop logic per round (optional)
+            # We simply keep the latest student per round; you can swap to a more complex per-epoch criterion if needed.
+
+            # Set student as new teacher for next round
+            teacher = student
+
+        # Final model is the last student
+        self.model_ = teacher
+        self._is_fitted = True
+        return self
+
+    def predict_proba(self, X) -> np.ndarray:
+        check_is_fitted(self, "_is_fitted")
+        return self._safe_predict_proba(self.model_, X, expect_2d=True)
+
+    def predict(self, X) -> np.ndarray:
+        check_is_fitted(self, "_is_fitted")
+        return (self.predict_proba(X) >= 0.5).astype(int)
+
+    def get_history(self) -> pd.DataFrame:
+        return pd.DataFrame(self.history_)
+
+    # -------------------------------
+    # Internals
+    # -------------------------------
+    def _threshold_for_round(self, r: int) -> Tuple[float, float]:
+        cfg = self.config
+        if not cfg.teacher_thresholds:
+            # default conservative thresholds
+            return (0.96, 0.04)
+        # cycle thresholds if list shorter than n_rounds
+        pair = cfg.teacher_thresholds[r % len(cfg.teacher_thresholds)]
+        return pair
+
+    def _harvest(
+        self,
+        p_teacher: np.ndarray,
+        used_mask: np.ndarray,
+        t_pos: float,
+        t_neg: float,
+        max_add: int,
+        min_new: int,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Return (indices, y_pseudo, confidence) of harvested items."""
+        available = ~used_mask
+        pick_pos = available & (p_teacher >= t_pos)
+        pick_neg = available & (p_teacher <= t_neg)
+
+        idx_pos = np.where(pick_pos)[0]
+        idx_neg = np.where(pick_neg)[0]
+
+        # Split capacity approximately evenly pos/neg
+        cap_half = max_add // 2
+        add_pos = idx_pos[:cap_half]
+        add_neg = idx_neg[:cap_half]
+        add_idx = np.concatenate([add_pos, add_neg])
+
+        if add_idx.size < min_new:
+            return np.array([], dtype=int), np.array([], dtype=int), np.array([], dtype=float)
+
+        # Labels & confidence
+        y_pseudo = np.zeros(add_idx.size, dtype=int)
+        y_pseudo[: add_pos.size] = 1
+        conf = np.maximum(p_teacher[add_idx], 1 - p_teacher[add_idx])
+        return add_idx, y_pseudo, conf
+
+    def _maybe_calibrate(
+        self,
+        estimator: BaseEstimator,
+        X_val: Optional[np.ndarray | pd.DataFrame],
+        y_val: Optional[np.ndarray | pd.Series],
+        sample_weight_val: Optional[np.ndarray] = None,
+    ) -> BaseEstimator:
+        cfg = self.config
+        if cfg.calibrate is None or X_val is None or y_val is None:
+            return estimator
+        calibrator = CalibratedClassifierCV(
+            base_estimator=estimator,
+            method=cfg.calibrate,
+            cv="prefit",
+        )
+        calibrator.fit(X_val, y_val, sample_weight=sample_weight_val)
+        return calibrator
+
+    def _metrics(
+        self,
+        estimator: BaseEstimator,
+        X_val: Optional[np.ndarray | pd.DataFrame],
+        y_val: Optional[np.ndarray | pd.Series],
+        sample_weight_val: Optional[np.ndarray] = None,
+    ) -> Dict[str, float]:
+        if X_val is None or y_val is None:
+            return {"auc": np.nan, "brier": np.nan}
+        p = self._safe_predict_proba(estimator, X_val)
+        try:
+            auc = roc_auc_score(y_val, p, sample_weight=sample_weight_val)
+        except Exception:
+            auc = np.nan
+        try:
+            brier = brier_score_loss(y_val, p, sample_weight=sample_weight_val)
+        except Exception:
+            brier = np.nan
+        return {"auc": float(auc), "brier": float(brier)}
+
+    @staticmethod
+    def _safe_predict_proba(model: BaseEstimator, X, expect_2d: bool = False) -> np.ndarray:
+        """Return p(y=1) as 1-D array. Supports models that return (n,2) or (n,)"""
+        proba = model.predict_proba(X)
+        if proba.ndim == 2:
+            p = proba[:, 1]
+        else:
+            # some models produce 1-D prob of positive class directly
+            p = np.asarray(proba)
+        if expect_2d:
+            return np.column_stack([1 - p, p])
+        return p
