@@ -172,7 +172,7 @@ class SelfLearningConfig:
     # Agreement (teacher vs previous student) only in early rounds
     require_agreement_rounds: int = 1  # how many initial rounds to enforce agreement
     agreement_tol: float = 0.15
-    confidence_floor: float = 0.5
+    confidence_floor: float = 0.1
 
     # Calibration & early stopping on validation
     calibrate: Optional[Literal["sigmoid", "isotonic"]] = None
@@ -291,7 +291,9 @@ class SelfLearningOrchestrator(BaseEstimator, ClassifierMixin):
 
         # X_u = np.asarray(X_u)
         n_u = len(X_u)
-        used_mask = np.zeros(n_u, dtype=bool)
+        
+        cum_added = 0
+        self.cum_unique_idx_ = set()
 
         # Teacher starts as baseline
         teacher = baseline_teacher
@@ -302,14 +304,21 @@ class SelfLearningOrchestrator(BaseEstimator, ClassifierMixin):
         no_improve = 0
 
         for r in range(cfg.n_rounds):
-            t_pos, t_neg = self._threshold_for_round(r)
+            #t_pos, t_neg = self._threshold_for_round(r)
 
             # 1) Score all remaining unlabeled with current teacher
             p_teacher = self._safe_predict_proba(teacher, X_u)  # [:,1]
+            
+            active_mask = np.zeros(n_u, dtype=bool)   # current round's pseudo set
+            
+            # Choose thresholds per mode (absolute/percentile/precision)
+            t_pos, t_neg, mode_used, extras = self._thresholds_for_round(
+                r, teacher, X_u, active_mask, X_val, y_val
+            )
 
             # 2) Harvest confident candidates
             add_idx, y_pseudo, conf = self._harvest(
-                p_teacher, used_mask, t_pos, t_neg,
+                p_teacher, active_mask, t_pos, t_neg,
                 cfg.max_add_per_round, cfg.min_new_per_round,
             )
 
@@ -320,7 +329,7 @@ class SelfLearningOrchestrator(BaseEstimator, ClassifierMixin):
                 student = self._maybe_calibrate(student, X_val, y_val, sample_weight_val)
                 self.model_ = student
                 self._is_fitted = True
-                self.history_.append({"round": r, "added": 0, **self._metrics(student, X_val, y_val, sample_weight_val)})
+                self.history_.append({"round": r, "cum_added": int(cum_added), "added": 0, **self._metrics(student, X_val, y_val, sample_weight_val)})
                 teacher = student  # next round uses student as teacher
                 continue
 
@@ -341,9 +350,12 @@ class SelfLearningOrchestrator(BaseEstimator, ClassifierMixin):
 
             # 3) Compute pseudo-weights
             if add_idx.size > 0:
+                active_mask[add_idx] = True
+                cum_added = add_idx.size  # update cumulative count
+
                 if cfg.use_propensity_weight and (propensity_u is not None):
                     prop = np.clip(propensity_u[add_idx].astype(float), 1e-6, np.inf)
-                    w_pseudo = np.clip((1.0 / prop) * np.maximum(conf, cfg.confidence_floor), 0.0, cfg.cap_ipw)
+                    w_pseudo = np.sqrt(np.clip((1.0 / prop) * np.maximum(conf, cfg.confidence_floor), 1e-3, cfg.cap_ipw))
                 else:
                     w_pseudo = 0.5 * np.maximum(conf, cfg.confidence_floor)
 
@@ -367,15 +379,17 @@ class SelfLearningOrchestrator(BaseEstimator, ClassifierMixin):
             round_metrics = {
                 "round": r,
                 "added": int(add_idx.size),
+                "cum_added": int(cum_added),
                 "t_pos": t_pos,
                 "t_neg": t_neg,
+                **extras,
                 **self._metrics(student, X_val, y_val, sample_weight_val),
             }
             self.history_.append(round_metrics)
 
             # Mark used
             if add_idx.size > 0:
-                used_mask[add_idx] = True
+                active_mask[add_idx] = True
 
             # --- Early stopping across rounds ---
             # Define a scalar score depending on metric
@@ -611,6 +625,75 @@ class SelfLearningOrchestrator(BaseEstimator, ClassifierMixin):
         )
         calibrator.fit(X_val, y_val, sample_weight=sample_weight_val)
         return calibrator
+    
+    def _tail_precision(
+        p: np.ndarray,
+        y: np.ndarray,
+        mode: str = "absolute",          # "absolute" or "percentile"
+        hi: float = 0.96,
+        lo: float = 0.04,
+        sample_weight: np.ndarray = None
+    ):
+        """
+        Compute precision in the high and low probability tails.
+
+        Parameters
+        ----------
+        p : array-like
+            Predicted probabilities for y=1.
+        y : array-like
+            True binary labels {0,1}.
+        mode : {"absolute","percentile"}
+            - "absolute": use hi/lo as probability cutoffs (e.g., 0.96 / 0.04)
+            - "percentile": use hi/lo as quantiles of p (e.g., 0.96 -> 96th percentile)
+        hi, lo : float
+            Thresholds interpreted per 'mode'.
+        sample_weight : array-like or None
+            Optional weights for precision calculation.
+
+        Returns
+        -------
+        prec_pos, prec_neg, n_pos, n_neg, t_pos_abs, t_neg_abs
+            Precision in the high tail, precision in the low tail,
+            counts in each tail, and the absolute probability cutoffs used.
+        """
+        p = np.asarray(p)
+        y = np.asarray(y)
+
+        # Determine absolute thresholds
+        if mode == "absolute":
+            t_pos_abs, t_neg_abs = float(hi), float(lo)
+        elif mode == "percentile":
+            t_pos_abs = float(np.quantile(p, hi))
+            t_neg_abs = float(np.quantile(p, lo))
+        else:
+            raise ValueError("mode must be 'absolute' or 'percentile'")
+
+        pos_mask = (p >= t_pos_abs)
+        neg_mask = (p <= t_neg_abs)
+
+        def _wmean(mask, positive=True):
+            n = int(mask.sum())
+            if n == 0:
+                return float("nan"), n
+            if sample_weight is None:
+                if positive:
+                    return float((y[mask] == 1).mean()), n
+                else:
+                    return float((y[mask] == 0).mean()), n
+            # weighted precision
+            w = np.asarray(sample_weight)[mask]
+            if positive:
+                num = (w * (y[mask] == 1)).sum()
+            else:
+                num = (w * (y[mask] == 0)).sum()
+            den = w.sum()
+            return float(num / den) if den > 0 else float("nan"), n
+
+        prec_pos, n_pos = _wmean(pos_mask, positive=True)
+        prec_neg, n_neg = _wmean(neg_mask, positive=False)
+
+        return prec_pos, prec_neg, n_pos, n_neg, t_pos_abs, t_neg_abs
 
     def _metrics(
         self,
@@ -627,15 +710,29 @@ class SelfLearningOrchestrator(BaseEstimator, ClassifierMixin):
         except Exception:
             auc = np.nan
         try:
-            precision, recall, thresholds = precision_recall_curve(y_actual, y_pred)
-            pr_auc = np.trapz(precision, recall)
+            precision, recall, thresholds = precision_recall_curve(y_val, p)
+            pr_auc = np.trapz(recall, precision)
         except Exception:
             pr_auc = np.nan
+        try:
+            if not self.config.percentile_pairs:
+                hi_q, lo_q = 0.96, 0.04
+            else:
+                hi_q, lo_q = self.config.percentile_pairs[0 % len(self.config.percentile_pairs)]
+            prec_pos, prec_neg, n_pos, n_neg, t_pos_abs, t_neg_abs = self._tail_precision(y_val, p, mode='percentile', hi=hi_q,lo=lo_q)
+        except Exception:
+            prec_pos = prec_neg = np.nan
         try:
             brier = brier_score_loss(y_val, p, sample_weight=sample_weight_val)
         except Exception:
             brier = np.nan
-        return {"auc": float(auc), "pr_auc": float(pr_auc), "brier": float(brier)}
+        return {
+            "auc": float(auc), 
+            "pr_auc": float(pr_auc), 
+            "prec_pos": float(prec_pos), 
+            "prec_neg":float(prec_neg),
+            "brier": float(brier)
+            }
 
     @staticmethod
     def _safe_predict_proba(model: BaseEstimator, X, expect_2d: bool = False) -> np.ndarray:

@@ -21,7 +21,7 @@ def f_roc_auc(y_actual, y_pred):
 def f_pr_auc(y_actual, y_pred):
     """Calculate the PR AUC."""
     precision, recall, thresholds = precision_recall_curve(y_actual, y_pred)
-    pr_auc = np.trapz(precision, recall)
+    pr_auc = np.trapz(recall, precision)
     return pr_auc
 
 def f_plot_auc(y_actual, y_pred):
