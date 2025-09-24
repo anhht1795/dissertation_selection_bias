@@ -73,9 +73,9 @@ def evaluate_at_approval_rate(
 
 # ----------------------------- Selection utils ------------------------------
 
-def propensity_overlap(pi: np.ndarray, eps: float = 0.05) -> np.ndarray:
+def propensity_overlap(pi: np.ndarray, range: tuple = (0.1,0.9)) -> np.ndarray:
     pi = np.asarray(pi).ravel()
-    return (pi >= eps) & (pi <= 1 - eps)
+    return (pi >= range[0]) & (pi <= 1 - range[1])
 
 
 def _z(x: np.ndarray, eps: float = 1e-9) -> np.ndarray:
@@ -103,7 +103,7 @@ def guided_select(
     pi_reject: np.ndarray,
     budget: int,
     approval_rate: float,
-    eps: float = 0.05,
+    range: tuple = (0.1,0.9),
     alpha_uncert: float = 0.6,
     alpha_boundary: float = 0.4,
     random_state: Optional[int] = 42,
@@ -112,7 +112,7 @@ def guided_select(
     pd_scores_reject = np.asarray(pd_scores_reject).ravel()
     pi_reject = np.asarray(pi_reject).ravel()
 
-    mask = propensity_overlap(pi_reject, eps)
+    mask = propensity_overlap(pi_reject, range)
     elig = np.where(mask)[0]
     if elig.size == 0:
         return np.array([], dtype=int)
@@ -127,12 +127,12 @@ def guided_select(
 def random_select(
     pi_reject: np.ndarray,
     budget: int,
-    eps: float = 0.05,
+    range: tuple = (0.1,0.9),
     random_state: Optional[int] = 42,
 ) -> np.ndarray:
     rng = np.random.RandomState(random_state)
     pi_reject = np.asarray(pi_reject).ravel()
-    mask = propensity_overlap(pi_reject, eps)
+    mask = propensity_overlap(pi_reject, range)
     elig = np.where(mask)[0]
     if elig.size == 0:
         return np.array([], dtype=int)
